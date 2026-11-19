@@ -4,8 +4,7 @@
 
 name: "Desktop CI builds"
 on:
-  push:
-  pull_request:
+  # This fork does not run desktop CI; only the Android workflow is dispatched.
   workflow_dispatch:
 
 #-------------------------------------------------------------------------------

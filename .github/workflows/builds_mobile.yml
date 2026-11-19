@@ -4,8 +4,8 @@
 
 name: "Mobile CI builds"
 on:
-  push:
-  pull_request:
+  # This fork is dispatched manually for the Android arm64-v8a artifact only.
+  # Pushes and pull requests must not fan out into unrelated mobile jobs.
   workflow_dispatch:
 
 concurrency:
@@ -249,6 +249,7 @@ jobs:
 
   ## iOS build #################################################################
   build-ios:
+    if: ${{ false }}
     name: "iOS CI build"
     # macos-latest tracks GitHub's current macOS image and ships the most recent
     # Xcode. App Store Connect now requires builds against the iOS 26 SDK

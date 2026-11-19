@@ -43,6 +43,7 @@ AndroidService *AndroidService::s_instance = nullptr;
 // thread so gotowork() touches DeviceManager/QObjects safely.
 static void jni_onWorkAlarm(JNIEnv *, jclass)
 {
+    qInfo() << "AndroidService: background work alarm received";
     if (AndroidService::s_instance)
         QMetaObject::invokeMethod(AndroidService::s_instance, "gotowork", Qt::QueuedConnection);
 }
@@ -98,38 +99,37 @@ void AndroidService::scheduleNextWork(int workInterval_mins)
 
 void AndroidService::gotowork()
 {
-    //m_notificationManager = NotificationManager::getInstance(); // DEBUG
-    //m_notificationManager->setNotification("AndroidService gotowork", QDateTime::currentDateTime().toString());
+    qInfo() << "AndroidService: background work cycle started";
 
-    // Reload settings, user might have changed them
+    // Reload settings; the same manager remains alive across alarm cycles so
+    // in-flight BLE operations and deferred MQTT reconnects are not destroyed.
     m_settingsManager->reloadSettings();
 
-    // Is the background service enabled?
     if (m_settingsManager->getSysTray())
     {
-        // Reload the device manager, a new scan might have occured
-        if (m_deviceManager) delete m_deviceManager;
-        m_deviceManager = new DeviceManager(true);
+        if (!m_deviceManager)
+        {
+            m_deviceManager = new DeviceManager(true);
 
-        // Hand the fresh DeviceManager to the foreground-service notifier so
-        // it re-attaches to the per-Device dataUpdated() signals (the old
-        // manager's Devices were destroyed with it).
-        if (m_foregroundNotifier) m_foregroundNotifier->attachDeviceManager(m_deviceManager);
+            if (m_foregroundNotifier)
+                m_foregroundNotifier->attachDeviceManager(m_deviceManager);
+        }
 
-        // Device manager is operational?
         if (m_deviceManager &&
             m_deviceManager->checkBluetooth() &&
             m_deviceManager->areDevicesAvailable())
         {
-            // Reload MQTT settings, user might have changed them
             if (m_settingsManager->getMQTT())
             {
                 MqttManager *mq = MqttManager::getInstance();
                 mq->reconnect();
             }
 
-            // Start background refresh process
+            // Existing discovery/refresh work runs first. The stock Xiaomi
+            // poll is requested from this same alarm cycle and waits inside
+            // DeviceManager until BLE is idle and MQTT is connected.
             m_deviceManager->refreshDevices_background();
+            m_deviceManager->pollStockXiaomiDevices();
         }
     }
 

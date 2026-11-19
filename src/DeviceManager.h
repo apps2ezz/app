@@ -176,8 +176,11 @@ class DeviceManager: public QObject
     bool m_checking_ios_ble = false;
     QTimer m_checking_ios_timer;
 
-    // Stock Xiaomi LYWSD03MMC active-GATT polling (5 minutes, one device at a time)
-    QTimer m_stockXiaomiPollTimer;
+    // Stock Xiaomi active-GATT polling is requested by the Android alarm.
+    // The retry timer only defers around BLE/MQTT activity; it is not the
+    // five-minute scheduler.
+    QTimer m_stockXiaomiPollRetryTimer;
+    bool m_stockXiaomiPollRequested = false;
     bool m_stockXiaomiPollMode = false;
 
     void setLastRun();
@@ -276,6 +279,7 @@ public:
     void refreshDevices_continue();
     void refreshDevices_finished(Device *dev);
     void pollStockXiaomiDevices();
+    void tryStartStockXiaomiPoll();
     void publishActiveMeasurement(Device *dev);
     Q_INVOKABLE void refreshDevices_stop();
 

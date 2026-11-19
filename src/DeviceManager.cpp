@@ -174,12 +174,12 @@ DeviceManager::DeviceManager(bool daemon)
         }
     }
 
-    // Poll stock Xiaomi sensors without changing the existing refresh policy.
-    // The queue and refresh manager provide bounded timeouts and no overlap.
-    m_stockXiaomiPollTimer.setInterval(300000);
-    connect(&m_stockXiaomiPollTimer, &QTimer::timeout,
-            this, &DeviceManager::pollStockXiaomiDevices);
-    m_stockXiaomiPollTimer.start();
+    // Stock Xiaomi polling is requested by AndroidService::gotowork().
+    // Do not use a five-minute DeviceManager timer: AndroidService owns the
+    // five-minute lifecycle and may otherwise destroy this object at the tick.
+    m_stockXiaomiPollRetryTimer.setSingleShot(true);
+    connect(&m_stockXiaomiPollRetryTimer, &QTimer::timeout,
+            this, &DeviceManager::tryStartStockXiaomiPoll);
 
 #if defined(DEBUG_FAKE_DEVICES)
     fakeTheengsDevices(); // Theengs fake devices //////////////////////////////
@@ -1406,12 +1406,47 @@ void DeviceManager::refreshDevices_continue()
 
 void DeviceManager::pollStockXiaomiDevices()
 {
-    // Never overlap a scheduled poll with a user/background refresh or scan.
-    if (isUpdating() || isScanning() || !hasBluetooth())
+    if (m_stockXiaomiPollMode)
+    {
+        qInfo() << "Stock Xiaomi background poll already running; skipping duplicate request";
+        return;
+    }
+
+    m_stockXiaomiPollRequested = true;
+    qInfo() << "Stock Xiaomi background poll requested";
+    tryStartStockXiaomiPoll();
+}
+
+void DeviceManager::tryStartStockXiaomiPoll()
+{
+    if (!m_stockXiaomiPollRequested || m_stockXiaomiPollMode)
         return;
 
+    MqttManager *mqtt = MqttManager::getInstance();
+
+    // Never interrupt an existing scan, advertisement listen window, or
+    // sequential refresh queue. A short retry keeps this request in the
+    // current Android alarm cycle without creating another BLE connection.
+    if (!hasBluetooth() ||
+        isUpdating() ||
+        isScanning() ||
+        !m_devices_updating_queue.isEmpty() ||
+        (m_bluetoothDiscoveryAgent && m_bluetoothDiscoveryAgent->isActive()))
+    {
+        m_stockXiaomiPollRetryTimer.start(1000);
+        return;
+    }
+
+    // A reconnect may be asynchronous. Keep the poll pending until the
+    // client is really Connected; publishData() deliberately rejects drops.
+    if (!mqtt || !mqtt->getStatus())
+    {
+        qInfo() << "Stock Xiaomi background poll waiting for MQTT connection";
+        m_stockXiaomiPollRetryTimer.start(1000);
+        return;
+    }
+
     m_devices_updating_queue.clear();
-    m_stockXiaomiPollMode = false;
 
     for (auto object : std::as_const(m_devices_model->m_devices))
     {
@@ -1419,7 +1454,6 @@ void DeviceManager::pollStockXiaomiDevices()
         if (!device || !device->isEnabled() || !device->hasBluetoothConnection())
             continue;
 
-        // Stock LYWSD03MMC is the only device covered by this polling fix.
         if (device->getName() != QStringLiteral("LYWSD03MMC"))
             continue;
 
@@ -1430,12 +1464,18 @@ void DeviceManager::pollStockXiaomiDevices()
         }
     }
 
-    if (!m_devices_updating_queue.isEmpty())
+    if (m_devices_updating_queue.isEmpty())
     {
-        qInfo() << "Stock Xiaomi poll scheduled:" << m_devices_updating_queue.size() << "device(s)";
-        m_stockXiaomiPollMode = true;
-        refreshDevices_continue();
+        m_stockXiaomiPollRequested = false;
+        qInfo() << "Stock Xiaomi background poll found no eligible sensors";
+        return;
     }
+
+    m_stockXiaomiPollRequested = false;
+    m_stockXiaomiPollMode = true;
+    qInfo() << "Stock Xiaomi background poll executing:"
+            << m_devices_updating_queue.size() << "device(s)";
+    refreshDevices_continue();
 }
 
 void DeviceManager::publishActiveMeasurement(Device *dev)
@@ -1446,7 +1486,7 @@ void DeviceManager::publishActiveMeasurement(Device *dev)
     DeviceSensor *sensor = qobject_cast<DeviceSensor *>(dev);
     MqttManager *mqtt = MqttManager::getInstance();
     SettingsManager *sm = SettingsManager::getInstance();
-    if (!sensor || !mqtt || !sm || !mqtt->getStatus())
+    if (!sensor || !mqtt || !sm)
         return;
 
     const float temperature = sensor->getTempC();
@@ -1460,6 +1500,15 @@ void DeviceManager::publishActiveMeasurement(Device *dev)
     const QString cleanAddress = QString(address).remove(':');
     if (cleanAddress.isEmpty())
         return;
+
+    qInfo() << "Stock Xiaomi GATT read succeeded" << address
+            << "temperature" << temperature << "humidity" << humidity;
+
+    if (!mqtt->getStatus())
+    {
+        qWarning() << "Stock Xiaomi reading not published: MQTT is not connected" << address;
+        return;
+    }
 
     QJsonObject payload;
     payload.insert("id", address);
@@ -1492,7 +1541,12 @@ void DeviceManager::refreshDevices_finished(Device *dev)
         // update next device in the list
         refreshDevices_continue();
         if (m_stockXiaomiPollMode && m_devices_updating_queue.empty() && m_devices_updating.empty())
+        {
             m_stockXiaomiPollMode = false;
+            qInfo() << "Stock Xiaomi background poll completed";
+            if (m_stockXiaomiPollRequested)
+                tryStartStockXiaomiPoll();
+        }
     }
 }
 
