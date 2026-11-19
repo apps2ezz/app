@@ -607,9 +607,31 @@ void Device::actionTimedOut()
     {
         m_refreshFailurePending = true;
 
-        // Let the disconnected callback close the transaction when a controller
-        // is still alive. This keeps the next queued device from reusing a BLE
-        // controller that is still connected or disconnecting.
+        // A timeout while the controller is still connecting can leave
+        // Qt without a disconnected() callback. There is no established link
+        // to wait for, so close the controller and complete the queued refresh.
+        if (previousStatus <= DeviceUtils::DEVICE_CONNECTING)
+        {
+            qWarning() << "BLE connection establishment timed out; completing refresh immediately"
+                       << getAddress() << getName();
+
+            m_stayConnected = false;
+            m_retry = s_retryCount;
+            if (m_bleController &&
+                m_bleController->state() != QLowEnergyController::UnconnectedState)
+            {
+                m_bleController->disconnectFromDevice();
+            }
+
+            m_ble_status = DeviceUtils::DEVICE_OFFLINE;
+            Q_EMIT statusUpdated();
+            completeRefreshFailure("connection-establishment-timeout",
+                                   previousAction, previousStatus);
+            return;
+        }
+
+        // For an established connection, wait for the disconnect callback
+        // before advancing the next queued device.
         if (m_bleController &&
             m_bleController->state() != QLowEnergyController::UnconnectedState)
         {
@@ -1615,6 +1637,19 @@ void Device::cleanRssi()
 void Device::deviceConnected()
 {
     qDebug() << "Device::deviceConnected(" << getAddress() << ")";
+
+    // A late connected() callback from a timed-out/failed connection must not
+    // revive the completed refresh or interfere with the next queued device.
+    if (m_ble_action == DeviceUtils::ACTION_IDLE && !m_stayConnected)
+    {
+        qWarning() << "Ignoring late BLE connected callback after refresh completion"
+                   << getAddress() << getName();
+        m_ble_status = DeviceUtils::DEVICE_OFFLINE;
+        Q_EMIT statusUpdated();
+        if (m_bleController)
+            m_bleController->disconnectFromDevice();
+        return;
+    }
 
     m_ble_status = DeviceUtils::DEVICE_CONNECTED;
 
