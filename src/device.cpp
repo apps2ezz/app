@@ -1739,6 +1739,31 @@ void Device::deviceErrored(QLowEnergyController::Error error)
     if (isRefreshAction(previousAction) && !m_refreshCompletionEmitted)
     {
         m_refreshFailurePending = true;
+
+        // A connection error during DEVICE_CONNECTING can leave Qt's
+        // controller without a subsequent disconnected() callback. There is
+        // no established link to wait for in this state, so close the
+        // controller and complete the queued refresh immediately.
+        if (previousStatus <= DeviceUtils::DEVICE_CONNECTING)
+        {
+            qWarning() << "BLE connection establishment failed; completing refresh immediately"
+                       << getAddress() << getName();
+
+            m_stayConnected = false;
+            m_retry = s_retryCount;
+            if (m_bleController &&
+                m_bleController->state() != QLowEnergyController::UnconnectedState)
+            {
+                m_bleController->disconnectFromDevice();
+            }
+
+            m_ble_status = DeviceUtils::DEVICE_OFFLINE;
+            Q_EMIT statusUpdated();
+            completeRefreshFailure("connection-establishment-error",
+                                   previousAction, previousStatus);
+            return;
+        }
+
         if (m_bleController &&
             m_bleController->state() != QLowEnergyController::UnconnectedState)
         {
