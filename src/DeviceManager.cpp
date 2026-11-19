@@ -1532,21 +1532,30 @@ void DeviceManager::publishActiveMeasurement(Device *dev)
 
 void DeviceManager::refreshDevices_finished(Device *dev)
 {
-    //qDebug() << "DeviceManager::refreshDevices_finished()" << dev->getAddress();
+    if (!dev)
+        return;
 
-    if (m_devices_updating.contains(dev))
+    if (!m_devices_updating.contains(dev))
     {
-        m_devices_updating.removeAll(dev);
+        qWarning() << "BLE refresh completion ignored: device is not in the active queue"
+                   << dev->getAddress() << dev->getName();
+        return;
+    }
 
-        // update next device in the list
-        refreshDevices_continue();
-        if (m_stockXiaomiPollMode && m_devices_updating_queue.empty() && m_devices_updating.empty())
-        {
-            m_stockXiaomiPollMode = false;
-            qInfo() << "Stock Xiaomi background poll completed";
-            if (m_stockXiaomiPollRequested)
-                tryStartStockXiaomiPoll();
-        }
+    m_devices_updating.removeAll(dev);
+    qInfo() << "BLE refresh queue advancing after terminal completion"
+            << dev->getAddress() << dev->getName()
+            << "remaining queued:" << m_devices_updating_queue.size();
+
+    // Every success and failure reaches this same path exactly once.
+    refreshDevices_continue();
+
+    if (m_stockXiaomiPollMode && m_devices_updating_queue.empty() && m_devices_updating.empty())
+    {
+        m_stockXiaomiPollMode = false;
+        qInfo() << "Stock Xiaomi background poll recovered/completed";
+        if (m_stockXiaomiPollRequested)
+            tryStartStockXiaomiPoll();
     }
 }
 

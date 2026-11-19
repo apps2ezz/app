@@ -557,9 +557,78 @@ void Device::actionCanceled()
     }
 }
 
+bool Device::isRefreshAction(int action) const
+{
+    return action == DeviceUtils::ACTION_UPDATE ||
+           action == DeviceUtils::ACTION_UPDATE_HISTORY;
+}
+
+void Device::completeRefreshFailure(const char *reason, int previousAction, int previousStatus)
+{
+    if (!isRefreshAction(previousAction))
+        return;
+
+    if (m_refreshCompletionEmitted)
+    {
+        qWarning() << "BLE refresh failure completion ignored as duplicate"
+                   << getAddress() << getName() << reason;
+        return;
+    }
+
+    m_refreshCompletionEmitted = true;
+    m_refreshFailurePending = false;
+    qWarning() << "BLE refresh failed completion" << getAddress() << getName()
+               << "reason:" << reason << "action:" << previousAction
+               << "status:" << previousStatus;
+
+    // Keep the failed action intact while the manager receives its one and only
+    // terminal signal. Resetting it first would drop deviceUpdated() and strand
+    // the sequential refresh queue.
+    if (previousAction == DeviceUtils::ACTION_UPDATE)
+        refreshDataFinished(false, false);
+    else
+        refreshHistoryFinished(false);
+
+    if (m_ble_action != DeviceUtils::ACTION_IDLE)
+    {
+        m_ble_action = DeviceUtils::ACTION_IDLE;
+        Q_EMIT actionUpdated();
+    }
+}
+
 void Device::actionTimedOut()
 {
-    qWarning() << "Device::actionTimedOut()" << getAddress() << getName() << "> action:" << m_ble_action;
+    const int previousAction = m_ble_action;
+    const int previousStatus = m_ble_status;
+    qWarning() << "BLE GATT action timed out" << getAddress() << getName()
+               << "action:" << previousAction << "status:" << previousStatus;
+
+    if (isRefreshAction(previousAction) && !m_refreshCompletionEmitted)
+    {
+        m_refreshFailurePending = true;
+
+        // Let the disconnected callback close the transaction when a controller
+        // is still alive. This keeps the next queued device from reusing a BLE
+        // controller that is still connected or disconnecting.
+        if (m_bleController &&
+            m_bleController->state() != QLowEnergyController::UnconnectedState)
+        {
+            m_stayConnected = false;
+            m_retry = s_retryCount;
+            if (m_ble_status != DeviceUtils::DEVICE_DISCONNECTING)
+            {
+                m_ble_status = DeviceUtils::DEVICE_DISCONNECTING;
+                Q_EMIT statusUpdated();
+            }
+            m_bleController->disconnectFromDevice();
+            return;
+        }
+
+        m_ble_status = DeviceUtils::DEVICE_OFFLINE;
+        Q_EMIT statusUpdated();
+        completeRefreshFailure("timeout", previousAction, previousStatus);
+        return;
+    }
 
     if (m_ble_action != DeviceUtils::ACTION_IDLE)
     {
@@ -579,9 +648,7 @@ void Device::actionTimedOut()
     }
 
     if (!m_stayConnected)
-    {
         deviceDisconnect();
-    }
 }
 
 void Device::actionKeepAlive()
@@ -614,6 +681,9 @@ void Device::refreshStart()
 {
     //qDebug() << "Device::refreshStart()" << getAddress() << getName() << "/ last update: " << getLastUpdateInt();
 
+    m_refreshCompletionEmitted = false;
+    m_refreshFailurePending = false;
+
     if (!isWorking())
     {
         actionStarted(DeviceUtils::ACTION_UPDATE);
@@ -624,6 +694,9 @@ void Device::refreshStart()
 void Device::refreshStartHistory()
 {
     //qDebug() << "Device::refreshStartHistory()" << getAddress() << getName();
+
+    m_refreshCompletionEmitted = false;
+    m_refreshFailurePending = false;
 
     if (!isWorking())
     {
@@ -660,54 +733,65 @@ void Device::refreshDataFinished(bool status, bool cached)
 {
     //qDebug() << "Device::refreshDataFinished()" << getAddress() << getName();
 
+    const int completedAction = m_ble_action;
+    const bool activeGattRefresh = !cached && isRefreshAction(completedAction);
+
+    // A timeout/error may be followed by a late read callback. It must not
+    // publish old data or complete the next cycle.
+    if (!cached && m_refreshCompletionEmitted && !activeGattRefresh)
+    {
+        qWarning() << "Ignoring late BLE refresh callback"
+                   << getAddress() << getName();
+        return;
+    }
+
+    if (activeGattRefresh && m_refreshCompletionEmitted)
+    {
+        qWarning() << "Ignoring duplicate BLE refresh completion"
+                   << getAddress() << getName() << completedAction;
+        return;
+    }
+
     m_timeoutTimer.stop();
+
+    if (activeGattRefresh)
+    {
+        m_refreshCompletionEmitted = true;
+        m_refreshFailurePending = false;
+        qInfo() << "BLE refresh terminal completion"
+                << getAddress() << getName()
+                << (status ? "success" : "failure");
+    }
 
     if (status == true)
     {
-        // Only update data on success
         Q_EMIT dataUpdated();
 
-        // Active GATT reads need to enter the same MQTT path as advertisements.
-        // Emit only for a normal update (not cached/history data).
-        if (!cached && m_ble_action == DeviceUtils::ACTION_UPDATE)
+        if (activeGattRefresh && completedAction == DeviceUtils::ACTION_UPDATE)
             Q_EMIT measurementUpdated(this);
 
-        // Reset last error
         m_lastError = QDateTime();
         Q_EMIT lastUpdated();
 
-        if (m_ble_action == DeviceUtils::ACTION_UPDATE)
-        {
+        if (completedAction == DeviceUtils::ACTION_UPDATE)
             Q_EMIT refreshUpdated();
-        }
-        else if (m_ble_action == DeviceUtils::ACTION_UPDATE_HISTORY)
-        {
+        else if (completedAction == DeviceUtils::ACTION_UPDATE_HISTORY)
             Q_EMIT historyUpdated();
-        }
     }
-    else
+    else if (!cached)
     {
-        // Set last error (if coming from BLE)
-        if (!cached)
-        {
-            m_lastError = QDateTime::currentDateTime();
-            Q_EMIT lastUpdated();
-        }
+        m_lastError = QDateTime::currentDateTime();
+        Q_EMIT lastUpdated();
     }
 
     checkDataAvailability();
 
-    // Inform device manager (if coming from BLE)
-    if (!cached)
+    if (activeGattRefresh)
     {
-        if (m_ble_action == DeviceUtils::ACTION_UPDATE)
-        {
+        if (completedAction == DeviceUtils::ACTION_UPDATE)
             Q_EMIT deviceUpdated(this);
-        }
-        else if (m_ble_action == DeviceUtils::ACTION_UPDATE_HISTORY)
-        {
+        else if (completedAction == DeviceUtils::ACTION_UPDATE_HISTORY)
             Q_EMIT deviceSynced(this);
-        }
     }
 }
 
@@ -715,20 +799,29 @@ void Device::refreshHistoryFinished(bool status)
 {
     //qDebug() << "Device::refreshHistoryFinished()" << getAddress() << getName();
 
+    if (m_refreshCompletionEmitted)
+    {
+        qWarning() << "Ignoring duplicate BLE history completion"
+                   << getAddress() << getName();
+        return;
+    }
+
+    m_refreshCompletionEmitted = true;
+    m_refreshFailurePending = false;
     m_timeoutTimer.stop();
+
+    qInfo() << "BLE history terminal completion"
+            << getAddress() << getName()
+            << (status ? "success" : "failure");
 
     if (status == true)
     {
         // TODO // Update 'last' data on success
     }
 
-    // Even if the status is false, we probably have some new data
     Q_EMIT dataUpdated();
     Q_EMIT historyUpdated();
-
-    checkDataAvailability(); // TODO // probably need more than that
-
-    // Inform device manager
+    checkDataAvailability();
     Q_EMIT deviceSynced(this);
 }
 
@@ -1586,19 +1679,22 @@ void Device::deviceConnected()
 
 void Device::deviceDisconnected()
 {
-    qDebug() << "Device::deviceDisconnected(" << getAddress() << ")";
+    const int previousAction = m_ble_action;
+    const int previousStatus = m_ble_status;
+    const bool refreshWasPending = m_refreshFailurePending;
+    qDebug() << "Device::deviceDisconnected(" << getAddress() << ")"
+             << "previous action:" << previousAction
+             << "previous status:" << previousStatus;
 
     m_timeoutTimer.stop();
     m_keepaliveTimer.stop();
 
     m_ble_status = DeviceUtils::DEVICE_OFFLINE;
     Q_EMIT statusUpdated();
-
-    // We are disconnected
     Q_EMIT disconnected();
 
-    if (m_ble_action == DeviceUtils::ACTION_UPDATE_REALTIME ||
-        m_ble_action == DeviceUtils::ACTION_UPDATE_HISTORY)
+    if (previousAction == DeviceUtils::ACTION_UPDATE_REALTIME ||
+        previousAction == DeviceUtils::ACTION_UPDATE_HISTORY)
     {
 #if defined(Q_OS_ANDROID) || defined(Q_OS_IOS)
         UtilsScreen *utilsScreen = UtilsScreen::getInstance();
@@ -1606,43 +1702,63 @@ void Device::deviceDisconnected()
 #endif
     }
 
-    if (m_ble_status == DeviceUtils::DEVICE_UPDATING)
+    if ((refreshWasPending ||
+         previousStatus == DeviceUtils::DEVICE_UPDATING ||
+         previousAction == DeviceUtils::ACTION_UPDATE) &&
+        !m_refreshCompletionEmitted)
     {
-        // This means we got forcibly disconnected by the device before completing the update
-        refreshDataFinished(false);
+        completeRefreshFailure("disconnect", previousAction, previousStatus);
     }
-    else if (m_ble_status == DeviceUtils::DEVICE_UPDATING_HISTORY)
-    {
-        // This means we got forcibly disconnected by the device before completing the history sync
-        refreshHistoryFinished(false);
-    }
-    else if (m_ble_status == DeviceUtils::DEVICE_UPDATING_REALTIME)
+    else if (previousStatus == DeviceUtils::DEVICE_UPDATING_REALTIME ||
+             previousAction == DeviceUtils::ACTION_UPDATE_REALTIME)
     {
         refreshRealtimeFinished();
+    }
+
+    if (isRefreshAction(previousAction) && m_ble_action != DeviceUtils::ACTION_IDLE)
+    {
+        m_ble_action = DeviceUtils::ACTION_IDLE;
+        Q_EMIT actionUpdated();
     }
 }
 
 void Device::deviceErrored(QLowEnergyController::Error error)
 {
     if (error <= QLowEnergyController::NoError) return;
-    qWarning() << "Device::deviceErrored(" << getAddress() << ") error:" << error;
-/*
-    QLowEnergyController::NoError	0	No error has occurred.
-    QLowEnergyController::UnknownError	1	An unknown error has occurred.
-    QLowEnergyController::UnknownRemoteDeviceError	2	The remote Bluetooth Low Energy device with the address passed to the constructor of this class cannot be found.
-    QLowEnergyController::NetworkError	3	The attempt to read from or write to the remote device failed.
-    QLowEnergyController::InvalidBluetoothAdapterError	4	The local Bluetooth device with the address passed to the constructor of this class cannot be found or there is no local Bluetooth device.
-    QLowEnergyController::ConnectionError (since Qt 5.5)	5	The attempt to connect to the remote device failed.
-    QLowEnergyController::AdvertisingError (since Qt 5.7)	6	The attempt to start advertising failed.
-    QLowEnergyController::RemoteHostClosedError (since Qt 5.10)	7	The remote device closed the connection.
-    QLowEnergyController::AuthorizationError (since Qt 5.14)	8	The local Bluetooth device closed the connection due to insufficient authorization.
-    QLowEnergyController::MissingPermissionsError (since Qt 6.4)	9	The operating system requests permissions which were not granted by the user.
-*/
+
+    const int previousAction = m_ble_action;
+    const int previousStatus = m_ble_status;
+    qWarning() << "Device::deviceErrored(" << getAddress() << ") error:" << error
+               << "action:" << previousAction << "status:" << previousStatus;
+
     m_timeoutTimer.stop();
     m_keepaliveTimer.stop();
-
     m_lastError = QDateTime::currentDateTime();
     Q_EMIT lastUpdated();
+
+    if (isRefreshAction(previousAction) && !m_refreshCompletionEmitted)
+    {
+        m_refreshFailurePending = true;
+        if (m_bleController &&
+            m_bleController->state() != QLowEnergyController::UnconnectedState)
+        {
+            m_stayConnected = false;
+            m_retry = s_retryCount;
+            if (m_ble_status != DeviceUtils::DEVICE_DISCONNECTING)
+            {
+                m_ble_status = DeviceUtils::DEVICE_DISCONNECTING;
+                Q_EMIT statusUpdated();
+            }
+            m_bleController->disconnectFromDevice();
+        }
+        else
+        {
+            m_ble_status = DeviceUtils::DEVICE_OFFLINE;
+            Q_EMIT statusUpdated();
+            completeRefreshFailure("error", previousAction, previousStatus);
+        }
+        return;
+    }
 
     if (m_ble_status < DeviceUtils::DEVICE_CONNECTED)
     {

@@ -266,6 +266,11 @@ protected:
     virtual void actionTimedOut();
     virtual void actionKeepAlive();
 
+    bool isRefreshAction(int action) const;
+    void completeRefreshFailure(const char *reason, int previousAction, int previousStatus);
+    bool m_refreshCompletionEmitted = false;
+    bool m_refreshFailurePending = false;
+
     virtual void refreshDataFinished(bool status, bool cached = false);
     virtual void refreshHistoryFinished(bool status);
     virtual void refreshRealtime();
